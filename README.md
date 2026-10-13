@@ -4,8 +4,8 @@
 ![FSL](https://img.shields.io/badge/FSL-6.x-orange.svg)
 ![Shell](https://img.shields.io/badge/shell-bash-lightgrey.svg)
 
-Fixes a specific, undocumented gap in FSL: computing a usable B0 fieldmap
-from **GE-scanner-style two-echo fieldmap acquisitions** (separate
+Computes a usable B0 fieldmap for FSL from
+**GE-scanner-style two-echo fieldmap acquisitions** (separate
 `phase1`/`phase2` and `magnitude1`/`magnitude2` images), which
 `fsl_prepare_fieldmap` does not natively support. Written and validated
 against a real GE (Discovery MR750) dataset from
@@ -19,33 +19,41 @@ Many GE scanners instead produce **two separate phase images at two
 separate echo times** -- exactly the format found in several public BIDS
 datasets (e.g. [OpenNeuro ds000201](https://openneuro.org/datasets/ds000201)).
 
-Naively subtracting the two raw (wrapped) phase images to get a
-"difference" produces incorrect values at phase wrap-around boundaries --
-a subtle bug that's easy to miss and can silently corrupt distortion
-correction in exactly the brain regions (frontal, temporal, near sinuses)
-where it matters most.
-
-## The fix
-
-The correct order of operations, per FSL's own FUGUE documentation:
+## The method
 
 1. Brain-extract the magnitude image (tight extraction, then lightly erode
    the mask to remove noisy edge voxels).
-2. Unwrap **each** phase image *separately* using FSL's `prelude`,
-   referenced to the same magnitude image.
-3. **Only then** subtract the two already-unwrapped images -- ordinary
-   subtraction is now valid, since both inputs are continuous
-   (non-wrapped) at this point.
-4. Scale by the echo time difference to get the fieldmap in rad/s, ready
-   for `fugue`.
+2. Form the **wrapped** phase difference: `phase2 - phase1`, re-wrapped
+   into [-π, π). This is the same as `angle(exp(i·phase2) · conj(exp(i·phase1)))`,
+   and it has one consistent wrap count by construction.
+3. Unwrap that single difference image with `prelude`.
+4. Remove any remaining whole-wrap offset (2π·k), using the in-brain median.
+5. Divide by the echo time difference to get the fieldmap in rad/s.
 
-This script automates exactly that sequence using only core FSL tools
-(`bet`, `prelude`, `fslmaths`) -- no additional packages required.
+Only core FSL tools (`bet`, `prelude`, `fslmaths`, `fslstats`) are used.
+
+## Changelog: v1 had a bug -- please re-run if you used it
+
+**v1 (September 2026) unwrapped `phase1` and `phase2` separately and then
+subtracted them.** That is wrong. `prelude` picks each image's global 2π
+offset independently, so the two unwrapped images can disagree by a constant
+2π·k. The resulting fieldmap is then shifted by k/ΔTE Hz everywhere -- 500 Hz
+per wrap at ΔTE = 2 ms.
+
+On ds000201 this affected **71 of 142 sessions** (offsets of 1 to 4 wraps).
+Those 71 sessions contained **all 56** catastrophic registration failures;
+the 71 unaffected sessions had none. v2 (this version) gives fieldmaps that
+match a reconstruction from the dataset's real/imaginary source data to
+within 0.014 rad/s (median), and centres every tested session within ~20 Hz
+of zero.
+
+If you ran v1, check the in-brain median of your fieldmap: a value near a
+multiple of 2π/ΔTE (≈ 3142 rad/s at ΔTE = 2 ms) means it was hit.
 
 ## Requirements
 
 - FSL installed and on your `PATH` (tested with FSL 6.x)
-- `python3` (only used for one arithmetic step; any version works)
+- `python3` (only used for arithmetic; any version works)
 
 ## Usage
 
@@ -61,63 +69,48 @@ Example, using BIDS-style filenames and echo times from the JSON sidecars:
     sub-01_magnitude1.nii.gz 6.8 8.8 sub-01_fieldmap
 ```
 
-Output: `sub-01_fieldmap_rads.nii.gz`, ready to use with `fugue`:
+Output: `sub-01_fieldmap_rads.nii.gz`, in rad/s, **in fieldmap space**.
+
+## Applying it: put the fieldmap on the EPI grid first
+
+`fugue --loadfmap` does **not** resample. It pairs fieldmap and EPI voxels
+by index. If the grids differ (on ds000201 the fieldmap is 64×64 at 3.75 mm
+and the BOLD is 128×128 at 1.875 mm), the shift map lands on one corner
+quarter of the EPI and the rest is left uncorrected, with no error or
+warning.
+
+Register the fieldmap to the EPI and resample it first. One way, via the T1:
 
 ```bash
-fugue --in=<your_epi_or_mean_func> \
+# fieldmap magnitude -> T1
+flirt -in fmap_mag_brain -ref T1_brain -dof 6 -omat fmap2str_init.mat
+flirt -in fmap_mag -ref T1 -dof 6 -init fmap2str_init.mat -omat fmap2str.mat -nosearch
+# EPI -> T1 (e.g. BBR), inverted, then chained: fieldmap -> EPI
+convert_xfm -omat str2epi.mat -inverse epi2str.mat
+convert_xfm -omat fmap2epi.mat -concat str2epi.mat fmap2str.mat
+applywarp -i sub-01_fieldmap_rads -r mean_epi --premat=fmap2epi.mat -o fmap_rads_epi
+
+fugue --in=mean_epi --loadfmap=fmap_rads_epi \
       --dwell=<EffectiveEchoSpacing_from_func_json> \
-      --loadfmap=sub-01_fieldmap_rads.nii.gz \
-      --unwarpdir=<y_or_y-_check_your_phase_encoding_direction> \
-      -u <output_unwarped.nii.gz>
+      --unwarpdir=<y_or_y-> -u mean_epi_unwarped
 ```
 
-## A note on phase image units
+`epi_reg --fmap=...` does this chain for you. If you use it, check that its
+output matrix actually differs from a run without `--fmap`.
 
-This script assumes your `phase1`/`phase2` images are already scaled to
-radians (approximately -π to π), which is standard BIDS convention. The
-script prints the actual value range so you can confirm this. If your
-data is instead in raw scanner integer units, you'll need to rescale to
-radians before running this script.
+**Check the unwarp direction.** Run both `y` and `y-` and keep the one that
+improves registration. On GE data the polarity in the BIDS JSON is not
+always right.
 
-## Why this matters
+**Always compare against no correction.** Compute a BBR cost (or similar)
+for corrected vs. uncorrected registration in each subject before trusting
+the correction.
 
-This exact issue cost real, avoidable debugging time on a student research
-project before the correct fix was identified. If you're hitting the same
-wall, hopefully this saves you that time.
+## Status on ds000201
 
-## What this script does NOT fix
-
-This script only fixes the phase-unwrap-order bug described above. It does
-**not** guarantee that the resulting fieldmap will actually improve your
-registration -- on at least one real subject from ds000201 (sub-9048), a
-fieldmap computed with this exact correct procedure still made BBR-based
-functional-to-structural alignment measurably *worse* than doing no
-distortion correction at all (BBR cost 0.489 corrected vs. 0.379
-uncorrected), and stayed worse across every fieldmap-sign and unwarp-
-direction combination tested, and across a dwell-time sweep from 0.25x to
-3x the BOLD JSON's stated `EffectiveEchoSpacing` -- cost degraded
-*monotonically* with correction magnitude, which points to the fieldmap
-itself not reflecting real distortion for that subject/session rather than
-any tunable sign or scaling bug.
-
-Suspected root cause: this is GE (Discovery MR750) data acquired with
-ASSET parallel imaging. `EffectiveEchoSpacing` for GE scanners is a
-*derived* quantity, not a native DICOM field -- `dcm2niix`'s own
-documentation describes the ASSET-aware calculation as producing
-"counterintuitive results with fractional reduction factors"
-([dcm2niix GE/README.md](https://github.com/rordenlab/dcm2niix/blob/master/GE/README.md)).
-An independent team preprocessing this same OpenNeuro dataset with
-fMRIPrep hit the identical symptom and abandoned GRE-fieldmap correction
-for it entirely in favor of synthetic (SyN-based) distortion correction
-([edickie/ds000201_preproc](https://github.com/edickie/ds000201_preproc)).
-
-**Practical takeaway:** always compute a BBR-cost (or equivalent) sanity
-check comparing corrected vs. uncorrected registration per-subject before
-trusting a GE-derived fieldmap -- don't assume "ran without error" means
-"actually improved alignment." This repo does not currently include a
-fix for the underlying `EffectiveEchoSpacing` unreliability; if you hit
-this, the validated fallback (per the above) is synthetic/fieldmapless
-distortion correction rather than tuning this script's inputs further.
+With both bugs above fixed, whether fieldmap correction improves
+registration on ds000201 is being re-tested across all 142 sessions. This
+section will be updated with the results.
 
 ## License
 
