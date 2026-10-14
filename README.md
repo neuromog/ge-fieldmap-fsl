@@ -99,8 +99,8 @@ fugue --in=mean_epi --loadfmap=fmap_rads_epi \
 output matrix actually differs from a run without `--fmap`.
 
 **Check the unwarp direction.** Run both `y` and `y-` and keep the one that
-improves registration. On GE data the polarity in the BIDS JSON is not
-always right.
+improves registration. On GE data the polarity in the BIDS JSON, or the
+sign of the phase images, may not match FSL's convention.
 
 **Always compare against no correction.** Compute a BBR cost (or similar)
 for corrected vs. uncorrected registration in each subject before trusting
@@ -127,8 +127,13 @@ What this shows:
 - **The catastrophic failures were caused by the two bugs**, not by the
   data. With both fixed there are none, apart from one subject (sub-9038)
   whose uncorrected registration was already poor.
-- **The phase-encoding direction in the BIDS JSON looks reversed.** `y-`
-  beat `y` in 140 of 142 sessions.
+- **The correct unwarp direction is the opposite of the BIDS JSON's.** `y-`
+  beat `y` in 140 of 142 sessions. That means either the JSON's
+  `PhaseEncodingDirection` or the sign convention of the GE phase images
+  (`phase2 - phase1`) is reversed. The two have exactly the same effect in
+  `fugue` and can't be told apart from these data. *(Corrected 2026-10-14:
+  an earlier version of this README said the JSON direction "looks
+  reversed".)*
 - **The JSON echo times (ΔTE = 2.0 ms) look right.** They beat 1.6 ms (from
   the GE series name `te6.4-8.0`) in 141 of 142 sessions.
 - **With the right direction, correction is close to neutral on this
