@@ -106,11 +106,39 @@ always right.
 for corrected vs. uncorrected registration in each subject before trusting
 the correction.
 
-## Status on ds000201
+## Results on ds000201
 
-With both bugs above fixed, whether fieldmap correction improves
-registration on ds000201 is being re-tested across all 142 sessions. This
-section will be updated with the results.
+Re-tested on all 142 sessions (71 subjects) with both bugs fixed: v2
+fieldmaps, resampled to the EPI grid, mean EPI unwarped with `fugue`, then
+BBR to the T1. Same white-matter segmentation, BBR schedule and starting
+point for every condition. Numbers are BBR cost minus the uncorrected cost
+(lower is better).
+
+| Condition | Median | Better than uncorrected | Failures (cost ≥ 0.95) |
+|---|---|---|---|
+| Old pipeline (v1 fieldmap, wrong grid) | +0.111 | 0 / 142 | 56 |
+| Fixed, direction from BIDS JSON (`y`) | +0.152 | 2 / 142 | 0 |
+| Fixed, opposite direction (`y-`) | +0.011 | 27 / 142 | 2 |
+| Fixed, `y-`, ΔTE = 1.6 ms instead of 2.0 ms | +0.052 | 2 / 142 | 2 |
+| Resampling only (fieldmap × 0.001) | −0.0001 | -- | 0 |
+
+What this shows:
+
+- **The catastrophic failures were caused by the two bugs**, not by the
+  data. With both fixed there are none, apart from one subject (sub-9038)
+  whose uncorrected registration was already poor.
+- **The phase-encoding direction in the BIDS JSON looks reversed.** `y-`
+  beat `y` in 140 of 142 sessions.
+- **The JSON echo times (ΔTE = 2.0 ms) look right.** They beat 1.6 ms (from
+  the GE series name `te6.4-8.0`) in 141 of 142 sessions.
+- **With the right direction, correction is close to neutral on this
+  measure.** It's slightly worse on average and better in 27 sessions (16 of
+  71 subjects). Resampling alone costs nothing, so this isn't interpolation
+  blur.
+
+BBR cost is a single whole-brain number. It may miss local improvements
+near the sinuses and temporal lobes, where distortion is worst, so check
+those regions visually before deciding either way.
 
 ## License
 
